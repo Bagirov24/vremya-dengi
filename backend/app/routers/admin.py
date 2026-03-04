@@ -1,8 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, desc
+from typing import Optional
+from uuid import UUID
+
 from app.database import get_db
-from app.routers.auth import get_current_user
+from app.utils.dependencies import get_current_active_user
 from app.models.user import User, SubscriptionPlan
 from app.models.transaction import Transaction
 from app.models.investment import Investment
@@ -10,7 +13,7 @@ from app.models.investment import Investment
 router = APIRouter()
 
 
-async def require_admin(user: User = Depends(get_current_user)):
+async def require_admin(user: User = Depends(get_current_active_user)):
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
@@ -21,9 +24,10 @@ async def admin_stats(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    users_count = await db.execute(select(func.count(User.id)))
-    tx_count = await db.execute(select(func.count(Transaction.id)))
-    inv_count = await db.execute(select(func.count(Investment.id)))
+    """Get platform-wide statistics."""
+    users_count = (await db.execute(select(func.count(User.id)))).scalar()
+    tx_count = (await db.execute(select(func.count(Transaction.id)))).scalar()
+    inv_count = (await db.execute(select(func.count(Investment.id)))).scalar()
 
     plan_stats = {}
     for plan in SubscriptionPlan:
@@ -33,48 +37,92 @@ async def admin_stats(
         plan_stats[plan.value] = count.scalar()
 
     return {
-        "total_users": users_count.scalar(),
-        "total_transactions": tx_count.scalar(),
-        "total_investments": inv_count.scalar(),
-        "subscription_stats": plan_stats,
+        "total_users": users_count,
+        "total_transactions": tx_count,
+        "total_investments": inv_count,
+        "subscription_breakdown": plan_stats,
     }
 
 
 @router.get("/users")
-async def admin_users(
-    skip: int = 0,
-    limit: int = 50,
+async def list_users(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    search: Optional[str] = None,
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(User).order_by(User.created_at.desc()).offset(skip).limit(limit)
-    )
+    """List all users with pagination."""
+    query = select(User)
+    if search:
+        query = query.where(
+            User.email.ilike(f"%{search}%") | User.full_name.ilike(f"%{search}%")
+        )
+
+    count_q = select(func.count()).select_from(query.subquery())
+    total = (await db.execute(count_q)).scalar()
+
+    query = query.order_by(desc(User.created_at)).offset((page - 1) * size).limit(size)
+    result = await db.execute(query)
     users = result.scalars().all()
-    return [
-        {
-            "id": str(u.id),
-            "email": u.email,
-            "full_name": u.full_name,
-            "is_active": u.is_active,
-            "subscription_plan": u.subscription_plan.value,
-            "xp": u.xp,
-            "level": u.level,
-            "created_at": str(u.created_at),
-        }
-        for u in users
-    ]
+
+    return {
+        "items": [
+            {
+                "id": str(u.id),
+                "email": u.email,
+                "full_name": u.full_name,
+                "is_active": u.is_active,
+                "is_verified": u.is_verified,
+                "subscription_plan": u.subscription_plan.value if u.subscription_plan else "free",
+                "xp": u.xp,
+                "level": u.level,
+                "created_at": u.created_at.isoformat() if u.created_at else None,
+            }
+            for u in users
+        ],
+        "total": total,
+        "page": page,
+        "size": size,
+    }
 
 
-@router.put("/users/{user_id}/toggle")
-async def toggle_user(
-    user_id: str,
+@router.put("/users/{user_id}/toggle-active")
+async def toggle_user_active(
+    user_id: UUID,
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    """Activate/deactivate user account."""
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
     user.is_active = not user.is_active
+    await db.flush()
+    await db.commit()
     return {"user_id": str(user.id), "is_active": user.is_active}
+
+
+@router.put("/users/{user_id}/set-plan")
+async def set_user_plan(
+    user_id: UUID,
+    plan: str,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set subscription plan for a user (admin override)."""
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    try:
+        user.subscription_plan = SubscriptionPlan(plan)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+
+    await db.flush()
+    await db.commit()
+    return {"user_id": str(user.id), "plan": plan}
