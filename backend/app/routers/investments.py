@@ -1,196 +1,123 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
-from pydantic import BaseModel
-from typing import Optional, List
-from datetime import datetime
+from typing import Optional
+from uuid import UUID
 
 from app.database import get_db
-from app.routers.auth import get_current_user
+from app.utils.dependencies import get_current_active_user
 from app.models.user import User
-from app.models.investment import Investment, Trade, Dividend, InvestmentType, BrokerType
+from app.services import investment_service
 
 router = APIRouter()
 
 
-class InvestmentCreate(BaseModel):
-    broker: str = "manual"
-    type: str
-    ticker: str
-    name: str
-    quantity: float = 0
-    avg_price: float = 0
-    current_price: float = 0
-    currency: str = "RUB"
-    sector: Optional[str] = None
+# --- Investments ---
+
+@router.get("/portfolio")
+async def portfolio_summary(
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get portfolio summary with P&L."""
+    return await investment_service.get_portfolio_summary(db, user.id)
 
 
-class TradeCreate(BaseModel):
-    investment_id: str
-    action: str  # buy / sell
-    quantity: float
-    price: float
-    commission: float = 0
-    date: Optional[datetime] = None
-    note: Optional[str] = None
-
-
-class DividendCreate(BaseModel):
-    investment_id: str
-    amount: float
-    tax: float = 0
-    payment_date: datetime
-    currency: str = "RUB"
-
-
-@router.get("")
-async def get_investments(
-    broker: Optional[str] = None,
+@router.get("/")
+async def list_investments(
     type: Optional[str] = None,
-    user: User = Depends(get_current_user),
+    broker: Optional[str] = None,
+    user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(Investment).where(Investment.user_id == user.id)
-    if broker:
-        query = query.where(Investment.broker == broker)
-    if type:
-        query = query.where(Investment.type == type)
-    query = query.order_by(Investment.created_at.desc())
-    result = await db.execute(query)
-    return result.scalars().all()
+    return await investment_service.get_investments(db, user.id, type, broker)
 
 
-@router.post("")
+@router.post("/")
 async def create_investment(
-    data: InvestmentCreate,
-    user: User = Depends(get_current_user),
+    data: dict,
+    user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    inv = Investment(
-        user_id=user.id,
-        broker=BrokerType(data.broker),
-        type=InvestmentType(data.type),
-        ticker=data.ticker,
-        name=data.name,
-        quantity=data.quantity,
-        avg_price=data.avg_price,
-        current_price=data.current_price,
-        currency=data.currency,
-        sector=data.sector,
-    )
-    db.add(inv)
-    await db.flush()
+    return await investment_service.create_investment(db, user.id, data)
+
+
+@router.get("/{investment_id}")
+async def get_investment(
+    investment_id: UUID,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    inv = await investment_service.get_investment_by_id(db, user.id, investment_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Investment not found")
     return inv
 
 
-@router.get("/portfolio")
-async def get_portfolio(
-    user: User = Depends(get_current_user),
+@router.put("/{investment_id}")
+async def update_investment(
+    investment_id: UUID,
+    data: dict,
+    user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Investment).where(Investment.user_id == user.id)
-    )
-    investments = result.scalars().all()
-    total_value = sum(i.quantity * i.current_price for i in investments)
-    total_cost = sum(i.quantity * i.avg_price for i in investments)
-    total_pnl = total_value - total_cost
-    pnl_percent = (total_pnl / total_cost * 100) if total_cost > 0 else 0
-
-    by_type = {}
-    for inv in investments:
-        t = inv.type.value if inv.type else "other"
-        if t not in by_type:
-            by_type[t] = 0
-        by_type[t] += inv.quantity * inv.current_price
-
-    return {
-        "total_value": round(total_value, 2),
-        "total_cost": round(total_cost, 2),
-        "total_pnl": round(total_pnl, 2),
-        "pnl_percent": round(pnl_percent, 2),
-        "positions_count": len(investments),
-        "by_type": by_type,
-    }
-
-
-@router.delete("/{inv_id}")
-async def delete_investment(
-    inv_id: str,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        select(Investment).where(and_(Investment.id == inv_id, Investment.user_id == user.id))
-    )
-    inv = result.scalar_one_or_none()
+    inv = await investment_service.update_investment(db, user.id, investment_id, data)
     if not inv:
         raise HTTPException(status_code=404, detail="Investment not found")
-    await db.delete(inv)
+    return inv
+
+
+@router.delete("/{investment_id}")
+async def delete_investment(
+    investment_id: UUID,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    deleted = await investment_service.delete_investment(db, user.id, investment_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Investment not found")
     return {"status": "deleted"}
 
 
 # --- Trades ---
-@router.post("/trades")
+
+@router.post("/{investment_id}/trades")
 async def create_trade(
-    data: TradeCreate,
-    user: User = Depends(get_current_user),
+    investment_id: UUID,
+    data: dict,
+    user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    trade = Trade(
-        investment_id=data.investment_id,
-        user_id=user.id,
-        action=data.action,
-        quantity=data.quantity,
-        price=data.price,
-        commission=data.commission,
-        date=data.date or datetime.utcnow(),
-        note=data.note,
-    )
-    db.add(trade)
-    await db.flush()
-    return trade
+    return await investment_service.create_trade(db, user.id, investment_id, data)
 
 
-@router.get("/trades/{inv_id}")
-async def get_trades(
-    inv_id: str,
-    user: User = Depends(get_current_user),
+@router.get("/trades/history")
+async def trade_history(
+    investment_id: Optional[UUID] = None,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Trade).where(and_(Trade.investment_id == inv_id, Trade.user_id == user.id)).order_by(Trade.date.desc())
-    )
-    return result.scalars().all()
+    items, total = await investment_service.get_trades(db, user.id, investment_id, page, size)
+    return {"items": items, "total": total, "page": page, "size": size}
 
 
 # --- Dividends ---
-@router.post("/dividends")
+
+@router.post("/{investment_id}/dividends")
 async def create_dividend(
-    data: DividendCreate,
-    user: User = Depends(get_current_user),
+    investment_id: UUID,
+    data: dict,
+    user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    div = Dividend(
-        investment_id=data.investment_id,
-        user_id=user.id,
-        amount=data.amount,
-        tax=data.tax,
-        payment_date=data.payment_date,
-        currency=data.currency,
-    )
-    db.add(div)
-    await db.flush()
-    return div
+    return await investment_service.create_dividend(db, user.id, investment_id, data)
 
 
-@router.get("/dividends/{inv_id}")
-async def get_dividends(
-    inv_id: str,
-    user: User = Depends(get_current_user),
+@router.get("/dividends/all")
+async def list_dividends(
+    investment_id: Optional[UUID] = None,
+    user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Dividend).where(and_(Dividend.investment_id == inv_id, Dividend.user_id == user.id)).order_by(Dividend.payment_date.desc())
-    )
-    return result.scalars().all()
+    return await investment_service.get_dividends(db, user.id, investment_id)
