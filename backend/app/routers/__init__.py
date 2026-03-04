@@ -1,1 +1,9 @@
-# routers package
+from app.routers.auth import router as auth_router
+from app.routers.transactions import router as transactions_router
+from app.routers.investments import router as investments_router
+from app.routers.billing import router as billing_router
+from app.routers.notifications import router as notifications_router
+from app.routers.settings import router as settings_router
+from app.routers.gamification import router as gamification_router
+from app.routers.health import router as health_router
+from app.routers.admin import router as admin_router
