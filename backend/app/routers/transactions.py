@@ -1,149 +1,212 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_
-from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional
 from datetime import datetime
-import uuid
+from uuid import UUID
 
 from app.database import get_db
-from app.routers.auth import get_current_user
+from app.utils.dependencies import get_current_active_user
 from app.models.user import User
-from app.models.transaction import Transaction, TransactionType
+from app.schemas.transaction import (
+    TransactionCreate, TransactionUpdate, TransactionResponse, TransactionListResponse,
+)
+from app.services import transaction_service
 
 router = APIRouter()
 
 
-class TransactionCreate(BaseModel):
-    type: str
-    amount: float
-    category: str
-    subcategory: Optional[str] = None
-    description: Optional[str] = None
-    date: Optional[datetime] = None
-    tags: Optional[list] = []
-    currency: Optional[str] = "RUB"
+@router.post("/", response_model=TransactionResponse, status_code=status.HTTP_201_CREATED)
+async def create_transaction(
+    data: TransactionCreate,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new transaction."""
+    tx = await transaction_service.create_transaction(db, user.id, data)
+    return tx
 
 
-class TransactionUpdate(BaseModel):
-    type: Optional[str] = None
-    amount: Optional[float] = None
-    category: Optional[str] = None
-    subcategory: Optional[str] = None
-    description: Optional[str] = None
-    date: Optional[datetime] = None
-    tags: Optional[list] = None
-
-
-@router.get("")
-async def get_transactions(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=200),
+@router.get("/", response_model=TransactionListResponse)
+async def list_transactions(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
     type: Optional[str] = None,
     category: Optional[str] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
-    user: User = Depends(get_current_user),
+    search: Optional[str] = None,
+    user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(Transaction).where(Transaction.user_id == user.id)
-    if type:
-        query = query.where(Transaction.type == type)
-    if category:
-        query = query.where(Transaction.category == category)
-    if date_from:
-        query = query.where(Transaction.date >= date_from)
-    if date_to:
-        query = query.where(Transaction.date <= date_to)
-    query = query.order_by(Transaction.date.desc()).offset(skip).limit(limit)
-    result = await db.execute(query)
-    return result.scalars().all()
-
-
-@router.post("")
-async def create_transaction(
-    data: TransactionCreate,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    tx = Transaction(
-        user_id=user.id,
-        type=TransactionType(data.type),
-        amount=data.amount,
-        category=data.category,
-        subcategory=data.subcategory,
-        description=data.description,
-        date=data.date or datetime.utcnow(),
-        tags=data.tags,
-        currency=data.currency,
+    """List transactions with filters and pagination."""
+    items, total = await transaction_service.get_transactions(
+        db, user.id, page, size, type, category, date_from, date_to, search
     )
-    db.add(tx)
-    await db.flush()
+    return {"items": items, "total": total, "page": page, "size": size}
+
+
+@router.get("/stats")
+async def transaction_stats(
+    period_days: int = Query(30, ge=1, le=365),
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get income/expense statistics for a period."""
+    return await transaction_service.get_transaction_stats(db, user.id, period_days)
+
+
+@router.get("/{transaction_id}", response_model=TransactionResponse)
+async def get_transaction(
+    transaction_id: UUID,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    tx = await transaction_service.get_transaction_by_id(db, user.id, transaction_id)
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
     return tx
 
 
-@router.put("/{tx_id}")
+@router.put("/{transaction_id}", response_model=TransactionResponse)
 async def update_transaction(
-    tx_id: str,
+    transaction_id: UUID,
     data: TransactionUpdate,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Transaction).where(and_(Transaction.id == tx_id, Transaction.user_id == user.id))
-    )
-    tx = result.scalar_one_or_none()
+    tx = await transaction_service.update_transaction(db, user.id, transaction_id, data)
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
-    for field, value in data.dict(exclude_unset=True).items():
-        setattr(tx, field, value)
     return tx
 
 
-@router.delete("/{tx_id}")
+@router.delete("/{transaction_id}")
 async def delete_transaction(
-    tx_id: str,
-    user: User = Depends(get_current_user),
+    transaction_id: UUID,
+    user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Transaction).where(and_(Transaction.id == tx_id, Transaction.user_id == user.id))
-    )
-    tx = result.scalar_one_or_none()
-    if not tx:
+    deleted = await transaction_service.delete_transaction(db, user.id, transaction_id)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Transaction not found")
-    await db.delete(tx)
     return {"status": "deleted"}
 
 
-@router.get("/summary")
-async def get_summary(
-    period: str = Query("month"),
-    user: User = Depends(get_current_user),
+# --- Budgets ---
+
+@router.post("/budgets")
+async def create_budget(
+    data: dict,
+    user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    now = datetime.utcnow()
-    if period == "month":
-        start = now.replace(day=1, hour=0, minute=0, second=0)
-    elif period == "week":
-        start = now - __import__("datetime").timedelta(days=now.weekday())
-        start = start.replace(hour=0, minute=0, second=0)
-    else:
-        start = now.replace(month=1, day=1, hour=0, minute=0, second=0)
+    budget = await transaction_service.create_budget(db, user.id, data)
+    return budget
 
-    income = await db.execute(
-        select(func.coalesce(func.sum(Transaction.amount), 0)).where(
-            and_(Transaction.user_id == user.id, Transaction.type == TransactionType.INCOME, Transaction.date >= start)
-        )
-    )
-    expense = await db.execute(
-        select(func.coalesce(func.sum(Transaction.amount), 0)).where(
-            and_(Transaction.user_id == user.id, Transaction.type == TransactionType.EXPENSE, Transaction.date >= start)
-        )
-    )
-    return {
-        "income": income.scalar(),
-        "expense": expense.scalar(),
-        "balance": income.scalar() - expense.scalar() if income.scalar() and expense.scalar() else 0,
-        "period": period,
-    }
+
+@router.get("/budgets")
+async def list_budgets(
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await transaction_service.get_budgets(db, user.id)
+
+
+@router.put("/budgets/{budget_id}")
+async def update_budget(
+    budget_id: UUID,
+    data: dict,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    budget = await transaction_service.update_budget(db, user.id, budget_id, data)
+    if not budget:
+        raise HTTPException(status_code=404, detail="Budget not found")
+    return budget
+
+
+@router.delete("/budgets/{budget_id}")
+async def delete_budget(
+    budget_id: UUID,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    deleted = await transaction_service.delete_budget(db, user.id, budget_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Budget not found")
+    return {"status": "deleted"}
+
+
+# --- Goals ---
+
+@router.post("/goals")
+async def create_goal(
+    data: dict,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await transaction_service.create_goal(db, user.id, data)
+
+
+@router.get("/goals")
+async def list_goals(
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await transaction_service.get_goals(db, user.id)
+
+
+@router.put("/goals/{goal_id}")
+async def update_goal(
+    goal_id: UUID,
+    data: dict,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    goal = await transaction_service.update_goal(db, user.id, goal_id, data)
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    return goal
+
+
+@router.delete("/goals/{goal_id}")
+async def delete_goal(
+    goal_id: UUID,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    deleted = await transaction_service.delete_goal(db, user.id, goal_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    return {"status": "deleted"}
+
+
+# --- Recurring Payments ---
+
+@router.get("/recurring")
+async def list_recurring(
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await transaction_service.get_recurring_payments(db, user.id)
+
+
+@router.post("/recurring")
+async def create_recurring(
+    data: dict,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await transaction_service.create_recurring_payment(db, user.id, data)
+
+
+@router.delete("/recurring/{rp_id}")
+async def delete_recurring(
+    rp_id: UUID,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    deleted = await transaction_service.delete_recurring_payment(db, user.id, rp_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Recurring payment not found")
+    return {"status": "deleted"}
